@@ -1,7 +1,7 @@
 use std::io::prelude::*;
 use std::io::{BufWriter, SeekFrom};
 
-use tokio::sync::{mpsc, oneshot};
+use std::sync::mpsc;
 
 use crate::client::appender::StreamSection;
 use crate::client::errors::{ClientError, ClientResult};
@@ -12,21 +12,18 @@ const APPEND_BUFFER_SIZE: usize = 8 * 1024; // 8KB
 struct AppendBuffer;
 
 impl AppendBuffer {
-    pub async fn init() -> ClientResult<AppendBufferHandle> {
+    pub fn init() -> ClientResult<AppendBufferHandle> {
         // TODO: named temp files have some security concerns (see docs), should they be written outside of temp directories?
         let file = tempfile::NamedTempFile::new()?;
-        let (req_tx, req_rx) = mpsc::channel::<AppendBufferReq>(1);
-        tokio::spawn(Self::handle_requests(file, req_rx));
+        let (req_tx, req_rx) = mpsc::channel::<AppendBufferReq>();
+        tokio::task::spawn_blocking(move || Self::handle_requests(file, req_rx));
         Ok(AppendBufferHandle { req_tx })
     }
 
-    async fn handle_requests(
-        file: tempfile::NamedTempFile,
-        mut req_rx: mpsc::Receiver<AppendBufferReq>,
-    ) {
+    fn handle_requests(file: tempfile::NamedTempFile, req_rx: mpsc::Receiver<AppendBufferReq>) {
         let mut offset = 0;
         let mut writer = std::io::BufWriter::with_capacity(APPEND_BUFFER_SIZE, file);
-        while let Some(op) = req_rx.recv().await {
+        while let Ok(op) = req_rx.recv() {
             match op {
                 AppendBufferReq::Write { res_tx, buf } => {
                     let _ = res_tx.send(Self::write(&mut writer, &mut offset, buf));
@@ -89,42 +86,38 @@ struct AppendBufferHandle {
 }
 
 impl AppendBufferHandle {
-    async fn write<B: Into<bytes::Bytes>>(&self, buf: B) -> ClientResult<AppendBufferStatus> {
-        let (res_tx, res_rx) = oneshot::channel::<ClientResult<AppendBufferStatus>>();
-        self.req_tx
-            .send(AppendBufferReq::Write {
-                res_tx,
-                buf: buf.into(),
-            })
-            .await?;
-        match res_rx.await {
+    fn write<B: Into<bytes::Bytes>>(&self, buf: B) -> ClientResult<AppendBufferStatus> {
+        let (res_tx, res_rx) = mpsc::channel::<ClientResult<AppendBufferStatus>>();
+        self.req_tx.send(AppendBufferReq::Write {
+            res_tx,
+            buf: buf.into(),
+        })?;
+        match res_rx.recv() {
             Err(err) => Err(ClientError::from(err)),
             Ok(res) => res,
         }
     }
 
-    async fn rollback(&self, checkpoint: usize) -> ClientResult<AppendBufferStatus> {
-        let (res_tx, res_rx) = oneshot::channel::<ClientResult<AppendBufferStatus>>();
+    fn rollback(&self, checkpoint: usize) -> ClientResult<AppendBufferStatus> {
+        let (res_tx, res_rx) = mpsc::channel::<ClientResult<AppendBufferStatus>>();
         self.req_tx
-            .send(AppendBufferReq::Rollback { res_tx, checkpoint })
-            .await?;
-        match res_rx.await {
+            .send(AppendBufferReq::Rollback { res_tx, checkpoint })?;
+        match res_rx.recv() {
             Err(err) => Err(ClientError::from(err)),
             Ok(res) => res,
         }
     }
 
-    async fn read(
+    fn read(
         &mut self,
         checkpoint: usize,
     ) -> ClientResult<StreamSection<tokio_util::io::ReaderStream<tokio::fs::File>>> {
-        let (res_tx, res_rx) = oneshot::channel::<
+        let (res_tx, res_rx) = mpsc::channel::<
             ClientResult<StreamSection<tokio_util::io::ReaderStream<tokio::fs::File>>>,
         >();
         self.req_tx
-            .send(AppendBufferReq::Read { res_tx, checkpoint })
-            .await?;
-        match res_rx.await {
+            .send(AppendBufferReq::Read { res_tx, checkpoint })?;
+        match res_rx.recv() {
             Err(err) => Err(ClientError::from(err)),
             Ok(res) => res,
         }
@@ -134,15 +127,15 @@ impl AppendBufferHandle {
 #[derive(Debug)]
 enum AppendBufferReq {
     Write {
-        res_tx: oneshot::Sender<ClientResult<AppendBufferStatus>>,
+        res_tx: mpsc::Sender<ClientResult<AppendBufferStatus>>,
         buf: bytes::Bytes,
     },
     Rollback {
-        res_tx: oneshot::Sender<ClientResult<AppendBufferStatus>>,
+        res_tx: mpsc::Sender<ClientResult<AppendBufferStatus>>,
         checkpoint: usize,
     },
     Read {
-        res_tx: oneshot::Sender<
+        res_tx: mpsc::Sender<
             ClientResult<StreamSection<tokio_util::io::ReaderStream<tokio::fs::File>>>,
         >,
         checkpoint: usize,
@@ -161,54 +154,54 @@ mod tests {
 
     #[tokio::test]
     async fn write_and_read() {
-        let mut append_buffer = AppendBuffer::init().await.unwrap();
+        let mut append_buffer = AppendBuffer::init().unwrap();
 
         // write
-        let write = append_buffer.write("hello").await.unwrap();
+        let write = append_buffer.write("hello").unwrap();
         assert_eq!(write.offset, 5);
         assert_eq!(write.buffer_len, 5);
-        let write = append_buffer.write("world").await.unwrap();
+        let write = append_buffer.write("world").unwrap();
         assert_eq!(write.offset, 10);
         assert_eq!(write.buffer_len, 10);
 
         // read
-        let stream = append_buffer.read(write.offset).await.unwrap();
+        let stream = append_buffer.read(write.offset).unwrap();
         let stream_contents = stream.to_vec().await;
         assert_eq!(&stream_contents, b"helloworld");
     }
 
     #[tokio::test]
     async fn write_and_rollback() {
-        let mut append_buffer = AppendBuffer::init().await.unwrap();
+        let mut append_buffer = AppendBuffer::init().unwrap();
 
         // write
-        let first_write = append_buffer.write("hello").await.unwrap();
+        let first_write = append_buffer.write("hello").unwrap();
         assert_eq!(first_write.offset, 5);
         assert_eq!(first_write.buffer_len, 5);
-        let second_write = append_buffer.write("world").await.unwrap();
+        let second_write = append_buffer.write("world").unwrap();
         assert_eq!(second_write.offset, 10);
         assert_eq!(second_write.buffer_len, 10);
 
         // rollback
-        let after_rollback = append_buffer.rollback(first_write.offset).await.unwrap();
+        let after_rollback = append_buffer.rollback(first_write.offset).unwrap();
         assert_eq!(after_rollback.offset, 5);
         assert_eq!(after_rollback.buffer_len, 0);
 
         // read
-        let stream = append_buffer.read(after_rollback.offset).await.unwrap();
+        let stream = append_buffer.read(after_rollback.offset).unwrap();
         let stream_contents = stream.to_vec().await;
         assert_eq!(&stream_contents, b"hello");
     }
 
     #[tokio::test]
     async fn write_and_read_from_different_tasks() {
-        let mut append_buffer = AppendBuffer::init().await.unwrap();
+        let mut append_buffer = AppendBuffer::init().unwrap();
 
         // write
         let append_buffer_moved = append_buffer.clone();
         tokio::spawn(async move {
-            append_buffer_moved.write("hello").await.unwrap();
-            append_buffer_moved.write("world").await.unwrap();
+            append_buffer_moved.write("hello").unwrap();
+            append_buffer_moved.write("world").unwrap();
         })
         .await
         .unwrap();
@@ -216,15 +209,15 @@ mod tests {
         // write
         let append_buffer_moved = append_buffer.clone();
         tokio::spawn(async move {
-            append_buffer_moved.write("foo").await.unwrap();
-            append_buffer_moved.write("bar").await.unwrap();
+            append_buffer_moved.write("foo").unwrap();
+            append_buffer_moved.write("bar").unwrap();
         })
         .await
         .unwrap();
 
         // read
         let expected_contents = b"helloworldfoobar";
-        let stream = append_buffer.read(expected_contents.len()).await.unwrap();
+        let stream = append_buffer.read(expected_contents.len()).unwrap();
         let stream_contents = stream.to_vec().await;
         assert_eq!(&stream_contents, expected_contents);
     }

@@ -62,4 +62,16 @@ mod std_errors {
             Self::IO(err.into_error())
         }
     }
+
+    impl<T> From<std::sync::mpsc::SendError<T>> for ClientError {
+        fn from(err: std::sync::mpsc::SendError<T>) -> Self {
+            Self::Channel(err.to_string())
+        }
+    }
+
+    impl From<std::sync::mpsc::RecvError> for ClientError {
+        fn from(err: std::sync::mpsc::RecvError) -> Self {
+            Self::Channel(err.to_string())
+        }
+    }
 }
