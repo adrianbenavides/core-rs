@@ -1,11 +1,12 @@
+use std::cmp::min;
+
 use tokio::sync::oneshot;
 use tokio_stream::{Stream, StreamExt};
 
 use protocol::extensions as pb_ext;
 use protocol::generated as pb;
 
-use crate::client::errors::ClientError;
-use crate::client::ClientResult;
+use crate::client::{ClientError, ClientResult};
 
 /// `Appender` adapts an `Append RPC` to the `Stream` trait. The first byte
 /// written to the `Appender` initiates the RPC. Subsequent bytes are streamed to
@@ -20,10 +21,10 @@ use crate::client::ClientResult;
 /// the append may or may commit.
 ///
 /// The application can cleanly roll-back a started `Appender` by `aborting` it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Appender {
     rjc: pb_ext::RoutedJournalClient,
-    request: pb::AppendRequest,
+    pub(crate) request: pb::AppendRequest,
 }
 
 impl Appender {
@@ -42,7 +43,7 @@ impl Appender {
     }
 
     /// Append the contents of a `Stream` to a journal as a single Append transaction.
-    pub async fn append<S>(&mut self, stream: S) -> ClientResult<pb::AppendResponse>
+    pub async fn append<S>(&mut self, stream: StreamSection<S>) -> ClientResult<pb::AppendResponse>
     where
         S: Stream<Item = std::io::Result<bytes::Bytes>> + Send + Sync + 'static + Unpin,
     {
@@ -67,7 +68,7 @@ impl Appender {
     /// Create an async `Stream` that is consumed by an Append RPC.
     fn stream<S>(
         &self,
-        mut stream: S,
+        mut stream: StreamSection<S>,
         stream_err_tx: oneshot::Sender<ClientError>,
     ) -> impl Stream<Item = pb::AppendRequest>
     where
@@ -81,9 +82,9 @@ impl Appender {
 
             yield request; // Send append request metadata as first message.
             loop {
-                match stream.next().await {
+                match stream.inner.next().await {
                     None => {
-                        // Clean EOF of |reader|. Commit by sending empty AppendRequest, then close.
+                        // Clean EOF of |stream|. Commit by sending empty AppendRequest, then close.
                         yield pb::AppendRequest::default();
                         return;
                     }
@@ -92,8 +93,17 @@ impl Appender {
                             continue;
                         }
 
-                        // Send non-empty content to broker.
-                        yield pb::AppendRequest { content: content.to_vec(), ..Default::default() };
+                        match stream.read(content) {
+                            None => {
+                                // EOF of |stream| section. Commit by sending empty AppendRequest, then close.
+                                yield pb::AppendRequest::default();
+                                return;
+                            },
+                            Some(content) => {
+                                // Send non-empty content to broker.
+                                yield pb::AppendRequest { content, ..Default::default() };
+                            }
+                        }
                     }
                     Some(Err(err)) => {
                         // Internal error. Retain it, and return _without_ sending an empty AppendRequest.
@@ -104,5 +114,55 @@ impl Appender {
                 }
             }
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct StreamSection<S>
+where
+    S: Stream<Item = std::io::Result<bytes::Bytes>> + Send + Sync + 'static + Unpin,
+{
+    inner: S,
+    bytes_read: usize,
+    checkpoint: usize,
+}
+
+impl<S> StreamSection<S>
+where
+    S: Stream<Item = std::io::Result<bytes::Bytes>> + Send + Sync + 'static + Unpin,
+{
+    pub fn new(inner: S, checkpoint: usize) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+            checkpoint,
+        }
+    }
+
+    fn read(&mut self, content: bytes::Bytes) -> Option<Vec<u8>> {
+        let n_to_read = min(content.len(), self.checkpoint - self.bytes_read);
+        if n_to_read == 0 {
+            // End of section
+            None
+        } else {
+            self.bytes_read += n_to_read;
+            Some(
+                content
+                    .get(..n_to_read)
+                    .expect("should have bytes in sub-range")
+                    .to_vec(),
+            )
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn to_vec(mut self) -> Vec<u8> {
+        let mut stream_contents = Vec::new();
+        while let Some(chunk) = self.inner.next().await {
+            if let Some(chunk) = &self.read(chunk.unwrap()) {
+                stream_contents.extend_from_slice(chunk);
+            }
+        }
+        stream_contents
     }
 }
