@@ -1,12 +1,14 @@
 use std::io::prelude::*;
 use std::io::{BufWriter, SeekFrom};
-
 use std::sync::mpsc;
 
-use crate::client::appender::StreamSection;
+use tokio::io::AsyncReadExt;
+
 use crate::client::errors::{ClientError, ClientResult};
 
 const APPEND_BUFFER_SIZE: usize = 8 * 1024; // 8KB
+
+type SectionStream = tokio_util::io::ReaderStream<tokio::io::Take<tokio::fs::File>>;
 
 #[derive(Debug)]
 struct AppendBuffer;
@@ -68,14 +70,11 @@ impl AppendBuffer {
     fn read(
         writer: BufWriter<tempfile::NamedTempFile>,
         checkpoint: usize,
-    ) -> ClientResult<StreamSection<tokio_util::io::ReaderStream<tokio::fs::File>>> {
+    ) -> ClientResult<SectionStream> {
         // TODO: handle flush error as in https://github.com/gazette/core/blob/master/broker/client/append_service.go#L453
         let reader = writer.into_inner()?.reopen()?; // Flush buffer into File and reopen to read contents.
-        let reader = tokio::fs::File::from(reader);
-        let stream = StreamSection::new(
-            tokio_util::io::ReaderStream::with_capacity(reader, APPEND_BUFFER_SIZE),
-            checkpoint,
-        );
+        let reader = tokio::fs::File::from(reader).take(checkpoint as u64);
+        let stream = tokio_util::io::ReaderStream::with_capacity(reader, APPEND_BUFFER_SIZE);
         Ok(stream)
     }
 }
@@ -108,13 +107,8 @@ impl AppendBufferHandle {
         }
     }
 
-    fn read(
-        &mut self,
-        checkpoint: usize,
-    ) -> ClientResult<StreamSection<tokio_util::io::ReaderStream<tokio::fs::File>>> {
-        let (res_tx, res_rx) = mpsc::channel::<
-            ClientResult<StreamSection<tokio_util::io::ReaderStream<tokio::fs::File>>>,
-        >();
+    fn read(&mut self, checkpoint: usize) -> ClientResult<SectionStream> {
+        let (res_tx, res_rx) = mpsc::channel::<ClientResult<SectionStream>>();
         self.req_tx
             .send(AppendBufferReq::Read { res_tx, checkpoint })?;
         match res_rx.recv() {
@@ -135,9 +129,7 @@ enum AppendBufferReq {
         checkpoint: usize,
     },
     Read {
-        res_tx: mpsc::Sender<
-            ClientResult<StreamSection<tokio_util::io::ReaderStream<tokio::fs::File>>>,
-        >,
+        res_tx: mpsc::Sender<ClientResult<SectionStream>>,
         checkpoint: usize,
     },
 }
@@ -151,6 +143,7 @@ struct AppendBufferStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_stream::StreamExt;
 
     #[tokio::test]
     async fn write_and_read() {
@@ -166,7 +159,7 @@ mod tests {
 
         // read
         let stream = append_buffer.read(write.offset).unwrap();
-        let stream_contents = stream.to_vec().await;
+        let stream_contents = read_stream_contents(stream).await;
         assert_eq!(&stream_contents, b"helloworld");
     }
 
@@ -189,7 +182,7 @@ mod tests {
 
         // read
         let stream = append_buffer.read(after_rollback.offset).unwrap();
-        let stream_contents = stream.to_vec().await;
+        let stream_contents = read_stream_contents(stream).await;
         assert_eq!(&stream_contents, b"hello");
     }
 
@@ -218,7 +211,15 @@ mod tests {
         // read
         let expected_contents = b"helloworldfoobar";
         let stream = append_buffer.read(expected_contents.len()).unwrap();
-        let stream_contents = stream.to_vec().await;
+        let stream_contents = read_stream_contents(stream).await;
         assert_eq!(&stream_contents, expected_contents);
+    }
+
+    async fn read_stream_contents(mut stream: SectionStream) -> Vec<u8> {
+        let mut stream_contents = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            stream_contents.extend_from_slice(&chunk.unwrap());
+        }
+        stream_contents
     }
 }

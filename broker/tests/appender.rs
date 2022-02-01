@@ -1,8 +1,10 @@
-use broker::client::appender::{Appender, StreamSection};
+use std::io::Write;
+use tokio::io::AsyncReadExt;
+
+use broker::client::appender::Appender;
 use broker::client::errors::ClientError;
 use protocol::extensions as pb_ext;
 use protocol::generated as pb;
-use std::io::Write;
 
 #[tokio::test]
 #[ignore]
@@ -35,9 +37,9 @@ async fn commits_successfully() {
         ..Default::default()
     };
     let mut file = tempfile::NamedTempFile::new().unwrap();
-    file.write_all(b"foo".as_slice()).unwrap();
-    let reader = tokio::fs::File::from(file.reopen().unwrap());
-    let stream = StreamSection::new(tokio_util::io::ReaderStream::new(reader), 3);
+    file.write_all(b"foobar".as_slice()).unwrap();
+    let reader = tokio::fs::File::from(file.reopen().unwrap()).take(3);
+    let stream = tokio_util::io::ReaderStream::new(reader);
     let mut appender = Appender::new(rjc, req).unwrap();
     let res = appender
         .append(stream)

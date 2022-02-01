@@ -1,4 +1,4 @@
-use errors::{ClientError, ClientResult};
+use errors::ClientResult;
 
 mod append_service;
 pub mod appender;
