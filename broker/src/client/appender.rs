@@ -20,10 +20,10 @@ use crate::client::ClientResult;
 /// the append may or may commit.
 ///
 /// The application can cleanly roll-back a started `Appender` by `aborting` it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Appender {
     rjc: pb_ext::RoutedJournalClient,
-    request: pb::AppendRequest,
+    pub(crate) request: pb::AppendRequest,
 }
 
 impl Appender {
