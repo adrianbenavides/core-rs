@@ -1,3 +1,6 @@
+use std::io::Write;
+use tokio::io::AsyncReadExt;
+
 use broker::client::appender::Appender;
 use broker::client::errors::ClientError;
 use protocol::extensions as pb_ext;
@@ -33,7 +36,9 @@ async fn commits_successfully() {
         journal: journal.clone(),
         ..Default::default()
     };
-    let reader = tokio::fs::File::open("test_data/read.txt").await.unwrap();
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(b"foobar".as_slice()).unwrap();
+    let reader = tokio::fs::File::from(file.reopen().unwrap()).take(3);
     let stream = tokio_util::io::ReaderStream::new(reader);
     let mut appender = Appender::new(rjc, req).unwrap();
     let res = appender

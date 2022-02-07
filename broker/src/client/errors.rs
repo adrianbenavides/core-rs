@@ -8,6 +8,9 @@ pub type ClientResult<T> = Result<T, ClientError>;
 
 #[derive(Error, Debug)]
 pub enum ClientError {
+    #[error("operational error")]
+    Operational(String),
+
     #[error("gRPC error")]
     Grpc(tonic::Status),
 
@@ -24,7 +27,7 @@ pub enum ClientError {
     IO(#[from] std::io::Error),
 }
 
-mod third_party {
+mod third_party_errors {
     use super::*;
 
     impl From<tonic::Status> for ClientError {
@@ -46,6 +49,28 @@ mod third_party {
 
     impl From<tokio::sync::oneshot::error::RecvError> for ClientError {
         fn from(err: tokio::sync::oneshot::error::RecvError) -> Self {
+            Self::Channel(err.to_string())
+        }
+    }
+}
+
+mod std_errors {
+    use super::*;
+
+    impl<W> From<std::io::IntoInnerError<W>> for ClientError {
+        fn from(err: std::io::IntoInnerError<W>) -> Self {
+            Self::IO(err.into_error())
+        }
+    }
+
+    impl<T> From<std::sync::mpsc::SendError<T>> for ClientError {
+        fn from(err: std::sync::mpsc::SendError<T>) -> Self {
+            Self::Channel(err.to_string())
+        }
+    }
+
+    impl From<std::sync::mpsc::RecvError> for ClientError {
+        fn from(err: std::sync::mpsc::RecvError) -> Self {
             Self::Channel(err.to_string())
         }
     }
