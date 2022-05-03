@@ -8,8 +8,8 @@ pub type ClientResult<T> = Result<T, ClientError>;
 
 #[derive(Error, Debug)]
 pub enum ClientError {
-    #[error("operational error")]
-    Operational(String),
+    #[error("runtime error")]
+    Runtime(String),
 
     #[error("gRPC error")]
     Grpc(tonic::Status),

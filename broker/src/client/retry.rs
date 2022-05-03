@@ -1,3 +1,7 @@
+use protocol::extensions as pb_ext;
+
+use crate::client::ClientResult;
+
 pub fn backoff(attempt: &mut i32) -> tokio::time::Duration {
     let duration = match attempt {
         0 | 1 => tokio::time::Duration::from_millis(50),
@@ -7,6 +11,26 @@ pub fn backoff(attempt: &mut i32) -> tokio::time::Duration {
     };
     *attempt += 1;
     duration
+}
+
+pub fn retry_until_blocking<T, F>(mut f: F, journal: &pb_ext::Journal, error_msg: &str) -> T
+where
+    F: FnMut() -> ClientResult<T>,
+{
+    let mut attempt = 0;
+    loop {
+        match f() {
+            Ok(res) => return res,
+            Err(err) => {
+                if attempt > 0 {
+                    tracing::warn!(
+                        "{error_msg} (will retry) [err={err}][attempt={attempt}][journal={journal}]"
+                    );
+                }
+                std::thread::sleep(backoff(&mut attempt));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
